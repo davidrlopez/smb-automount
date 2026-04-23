@@ -1,0 +1,568 @@
+#!/bin/zsh
+set -e
+
+CONFIG_DIR="$HOME/.config/smb-automount"
+CONFIG_FILE="$CONFIG_DIR/config"
+AGENTS_DIR="$HOME/Library/LaunchAgents"
+SCRIPTS_DIR="$HOME/.local/bin"
+LABEL_PREFIX="com.davidromanlopez.smb-automount"
+
+typeset -a SHARES
+typeset -A SMB_HOST_MAP
+typeset -A SMB_USER_MAP
+
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+print_ok() { echo -e "${GREEN}$1${NC}"; }
+print_warn() { echo -e "${YELLOW}$1${NC}"; }
+print_err() { echo -e "${RED}$1${NC}"; }
+
+pick_from_list() {
+    local prompt=$1
+    shift
+    local -a items=("$@")
+    local selected=1
+    local key ESC=$'\033'
+    tput civis 2>/dev/null
+_render_list() {
+        echo "$prompt"
+        for (( i=1; i<=${#items[@]}; i++ )); do
+            if [[ $i -eq $selected ]]; then
+                echo -e "  ${GREEN}▶ ${items[$i]}${NC}"
+            else
+                echo "    ${items[$i]}"
+            fi
+        done
+    }
+    _clear_list() {
+        for (( i=0; i<=${#items[@]}; i++ )); do
+            tput cuu1; tput el
+        done
+    }
+
+    _render_list
+
+    while IFS= read -r -s -k1 key; do
+        if [[ $key == $ESC ]]; then
+            read -r -s -k2 -t 0.1 key2
+            key="$key$key2"
+        fi
+        case "$key" in
+            $ESC'[A'|$ESC'OA')
+                (( selected > 1 )) && (( selected-- ))
+                ;;
+            $ESC'[B'|$ESC'OB')
+                (( selected < ${#items[@]} )) && (( selected++ ))
+                ;;
+            $'\n'|$'\r')
+                _clear_list
+                tput cnorm 2>/dev/null
+                PICKED="${items[$selected]}"
+                return 0
+                ;;
+        esac
+        _clear_list
+        _render_list
+    done
+}
+
+discover_smb_hosts() {
+    typeset -ga DISCOVERED_HOSTS
+    DISCOVERED_HOSTS=()
+    print_warn "Scanning Tailscale and Local Network..."
+    local ts_cmd=""
+    if command -v tailscale &>/dev/null; then
+        ts_cmd="tailscale"
+    elif [[ -x "/Applications/Tailscale.app/Contents/MacOS/Tailscale" ]]; then
+        ts_cmd="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+    fi
+
+    if [[ -n "$ts_cmd" ]]; then
+        while read -r ip host rest; do
+            if [[ $ip == 100.* ]]; then
+                DISCOVERED_HOSTS+=("$ip  ($host [Tailscale])")
+            fi
+        done < <("$ts_cmd" status 2>/dev/null | grep "^100\.")
+    fi
+
+    local raw
+    raw=$(dns-sd -B _smb._tcp local. 2>/dev/null &
+          local pid=$!
+          sleep 5
+          kill "$pid" 2>/dev/null
+          wait "$pid" 2>/dev/null) || true
+
+    local -a hostnames
+    hostnames=($(echo "$raw" | awk '/Add/{print $NF}' | sort -u))
+
+    for host in "${hostnames[@]}"; do
+        local ip
+        ip=$(dns-sd -G v4 "${host}.local." 2>/dev/null &
+             local pid=$!
+             sleep 2
+             kill "$pid" 2>/dev/null
+             wait "$pid" 2>/dev/null \
+             | awk '/Add/{print $6; exit}') || true
+        if [[ -n "$ip" ]]; then
+            if ! printf "%s\n" "${DISCOVERED_HOSTS[@]}" | grep -q "^$ip "; then
+                DISCOVERED_HOSTS+=("$ip  ($host [Local])")
+            fi
+        elif [[ -n "$host" ]]; then
+            DISCOVERED_HOSTS+=("${host}.local  ([Local])")
+        fi
+    done
+    DISCOVERED_HOSTS+=("Enter manually")
+}
+
+urlencode() {
+    local string="${1}"
+    local strlen=${#string}
+    local encoded=""
+    local pos c o
+
+    for (( pos=0 ; pos<strlen ; pos++ )); do
+        c=${string:$pos:1}
+        case "$c" in
+            [-_.~a-zA-Z0-9] ) o="${c}" ;;
+            * )               o=$(printf '%%%02x' "'$c")
+        esac
+        encoded="${encoded}${o}"
+    done
+    echo "${encoded}"
+}
+
+load_config() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        source "$CONFIG_FILE"
+        for share in "${SHARES[@]}"; do
+            local host_var="SMB_HOST_${share}"
+            local user_var="SMB_USER_${share}"
+            SMB_HOST_MAP[$share]="${(P)host_var}"
+            SMB_USER_MAP[$share]="${(P)user_var}"
+        done
+        return 0
+    fi
+    return 1
+}
+
+save_config() {
+    mkdir -p "$CONFIG_DIR"
+    {
+        echo "SHARES=(${SHARES[*]})"
+        for share in "${SHARES[@]}"; do
+            echo "SMB_HOST_${share}=\"${SMB_HOST_MAP[$share]}\""
+            echo "SMB_USER_${share}=\"${SMB_USER_MAP[$share]}\""
+        done
+    } >"$CONFIG_FILE"
+}
+
+save_keychain() {
+    local share_name=$1
+    local smb_user="${SMB_USER_MAP[$share_name]}"
+    local smb_host="${SMB_HOST_MAP[$share_name]}"
+
+    security delete-generic-password -s "smb-automount-$share_name" -a "$smb_user" &>/dev/null || true
+    security delete-internet-password -s "$smb_host" -a "$smb_user" &>/dev/null || true
+    security delete-internet-password -s "$smb_host" -a "$smb_user" -r "smb " &>/dev/null || true
+
+    if security add-generic-password \
+        -s "smb-automount-$share_name" \
+        -a "$smb_user" \
+        -w "$SMB_PASS" \
+        -A; then
+        print_ok "Credentials saved"
+    else
+        print_err "Credentials not saved"
+        exit 1
+    fi
+}
+
+test_mount() {
+    local user=$(urlencode "$1")
+    local pass=$(urlencode "$2")
+    local host=$3
+    local share=$4
+    print_warn "Verifying access to '//$host/$share'..."
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+
+    if mount_smbfs "//$user:$pass@$host/$share" "$tmp_dir" &>/dev/null; then
+        diskutil unmount force "$tmp_dir" &>/dev/null || umount -f "$tmp_dir" &>/dev/null
+        rmdir "$tmp_dir" &>/dev/null
+        return 0
+    else
+        rmdir "$tmp_dir" &>/dev/null
+        return 1
+    fi
+}
+
+setup_sudoers() {
+    local uid
+    uid=$(id -u)
+    local tmp
+    tmp=$(mktemp)
+
+    for share in "${SHARES[@]}"; do
+        printf '%s ALL=(ALL) NOPASSWD: /bin/mkdir -p /Volumes/%s\n' "$USER" "$share" >>"$tmp"
+        printf '%s ALL=(ALL) NOPASSWD: /usr/sbin/chown %s /Volumes/%s\n' "$USER" "$uid" "$share" >>"$tmp"
+    done
+
+    if sudo visudo -c -f "$tmp" &>/dev/null; then
+        sudo cp "$tmp" /etc/sudoers.d/smb-automount
+        sudo chmod 440 /etc/sudoers.d/smb-automount
+        rm -f "$tmp"
+        print_ok "Sudoers configured"
+    else
+        rm -f "$tmp"
+        print_err "Sudoers syntax error — not applied"
+        exit 1
+    fi
+}
+
+generate_mount_script() {
+    local share_name=$1
+    local smb_user_enc=$(urlencode "{SMB_USER_MAP[$share_name]}")
+    local smb_host="${SMB_HOST_MAP[$share_name]}"
+    local mount_script="$SCRIPTS_DIR/smb-automount-$share_name.sh"
+    mkdir -p "$SCRIPTS_DIR"
+
+    cat >"$mount_script" <<SCRIPT_EOF
+#!/bin/bash
+sleep \$((RANDOM % 5))
+if ! mount | grep -q "on /Volumes/$share_name "; then
+LOCKDIR="/tmp/smb-automount.lock"
+    while ! /bin/mkdir "\$LOCKDIR" 2>/dev/null; do
+        sleep 1
+    done
+    trap 'rmdir "\$LOCKDIR" 2>/dev/null' EXIT
+    RAW_PASS=\$(security find-generic-password -s "smb-automount-$share_name" -w 2>/dev/null)
+    if [ -n "\$RAW_PASS" ]; then
+        PASSWORD=\$(printf '%s' "\$RAW_PASS" | perl -MURI::Escape -ne 'print uri_escape(\$_)')
+        sudo /bin/mkdir -p "/Volumes/$share_name"
+        sudo /usr/sbin/chown $UID "/Volumes/$share_name"
+        /sbin/mount_smbfs "//$user_enc:\${PASSWORD}@$smb_host/$share_name" "/Volumes/$share_name"
+    fi
+fi
+SCRIPT_EOF
+    if chmod +x "$mount_script"; then
+        print_ok "Mount script generated in $mount_script"
+    else
+        print_err "Mount script not generated"
+        exit 1
+    fi
+}
+
+generate_plist() {
+    local share_name=$1
+    local label="$LABEL_PREFIX-$share_name"
+    local plist="$AGENTS_DIR/$label.plist"
+    local mount_script="$SCRIPTS_DIR/smb-automount-$share_name.sh"
+
+    if
+        cat >"$plist" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>$label</string>
+    <key>ProgramArguments</key><array><string>/bin/bash</string><string>$mount_script</string></array>
+    <key>RunAtLoad</key><true/>
+    <key>StartInterval</key><integer>15</integer>
+</dict>
+</plist>
+PLIST_EOF
+    then
+        print_ok "Launch Agent generated"
+    else
+        print_err "Launch Agent not generated"
+    fi
+}
+
+cleanup_stale_mounts() {
+    for share in "${SHARES[@]}"; do
+        local mount_point="/Volumes/$share"
+        if [ -d "$mount_point" ] && ! mount | grep -q "$mount_point"; then
+            print_warn "Found stale mount point $mount_point"
+            sudo rmdir "$mount_point" 2>/dev/null || true
+        fi
+    done
+}
+
+load_agent() {
+    local share_name=$1
+    local plist="$AGENTS_DIR/$LABEL_PREFIX-$share_name.plist"
+
+    cleanup_stale_mounts
+
+    unload_agent "$share_name"
+    sleep 1
+    force_unmount "$share_name"
+
+    if launchctl load "$plist"; then
+        print_ok "Launch Agent loaded"
+    else
+        print_err "Launch Agent failed to load"
+        exit 1
+    fi
+}
+
+unload_agent() {
+    local share_name=$1
+    local plist="$AGENTS_DIR/$LABEL_PREFIX-$share_name.plist"
+    launchctl unload "$plist" 2>/dev/null || true
+}
+
+list() {
+    if [[ ${#SHARES[@]} -eq 0 ]]; then
+        print_warn "List empty"
+        return
+    fi
+    for share in "${SHARES[@]}"; do
+        echo "  · $share → ${SMB_HOST_MAP[$share]} (${SMB_USER_MAP[$share]})"
+    done
+}
+
+force_unmount() {
+    local share_name=$1
+    local mount_point="/Volumes/$share_name"
+
+    if mount | grep -q "on $mount_point "; then
+        diskutil unmount force "$mount_point" 2>/dev/null || umount -f "$mount_point" 2>/dev/null || true
+    fi
+
+    if [ -d "$mount_point" ]; then
+        sudo rmdir "$mount_point" 2>/dev/null || true
+    fi
+}
+
+_remove_one() {
+    local share_name=$1
+    print_warn "Removing '$share_name'..."
+    force_unmount "$share_name"
+    unload_agent "$share_name"
+    rm -f "$AGENTS_DIR/$LABEL_PREFIX-$share_name.plist"
+    rm -f "$SCRIPTS_DIR/smb-automount-$share_name.sh"
+    security delete-generic-password -s "smb-automount-$share_name" -a "${SMB_USER_MAP[$share_name]}" &>/dev/null || true
+
+    SHARES=("${SHARES[@]/$share_name/}")
+    SHARES=("${SHARES[@]:#}")
+    unset "SMB_HOST_MAP[$share_name]"
+    unset "SMB_USER_MAP[$share_name]"
+    print_ok "'$share_name' removed"
+}
+
+remove() {
+    local flag="${1:-}"
+
+    if [[ ${#SHARES[@]} -eq 0 ]]; then
+        print_warn "No shares configured."
+        exit 0
+    fi
+
+    if [[ "$flag" == "--all" || "$flag" == "-all" ]]; then
+        read -r "confirm? Remove ALL shares? This cannot be undone. [y/N]: "
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            print_warn "Aborted."
+            exit 0
+        fi
+        local all_shares=("${SHARES[@]}")
+        for share_name in "${all_shares[@]}"; do
+            _remove_one "$share_name"
+        done
+        save_config
+        setup_sudoers
+        return
+    fi
+
+    pick_from_list "Select share to remove:" "${SHARES[@]}"
+    local share_name="$PICKED"
+
+    _remove_one "$share_name"
+    save_config
+    setup_sudoers
+}
+
+uninstall() {
+    print_warn "Uninstalling smb-automount..."
+    load_config || true
+
+    if [[ ${#SHARES[@]} -gt 0 ]]; then
+        local all_shares=("${SHARES[@]}")
+        for share_name in "${all_shares[@]}"; do
+            _remove_one "$share_name"
+        done
+    fi
+
+    rm -f "$CONFIG_FILE"
+    rmdir "$CONFIG_DIR" 2>/dev/null || true
+    sudo rm -f /etc/sudoers.d/smb-automount
+    print_ok "Uninstalled completely"
+}
+
+apply_share_config() {
+    local share_name=$1
+    save_config
+    save_keychain "$share_name"
+    generate_mount_script "$share_name"
+    generate_plist "$share_name"
+    setup_sudoers
+    load_agent "$share_name"
+}
+
+check_server_reachable() {
+    local host=$1
+    if smbutil status "$host" &>/dev/null; then
+        print_ok "Server available"
+    else
+        print_err "Server unreachable"
+        exit 1
+    fi
+}
+
+add() {
+    print_warn "Starting new share configuration..."
+    discover_smb_hosts
+    local smb_host=""
+    if [[ ${#DISCOVERED_HOSTS[@]} -gt 1 ]]; then
+        pick_from_list "Select server:" "${DISCOVERED_HOSTS[@]}"
+        if [[ "$PICKED" == "Enter manually" ]]; then
+            read -r "smb_host? Server IP: "
+        else
+            smb_host="${PICKED%%  *}"
+        fi
+    else
+        read -r "smb_host? Server IP: "
+    fi
+
+  check_server_reachable "$smb_host"
+
+    read -r "smb_user? SMB User: "
+    read -sr "SMB_PASS? Password: "
+    echo
+    print_warn "Fetching available shares from $smb_host..."
+    local -a available_shares=()
+    local view_out
+
+    if view_out=$(smbutil view "//$smb_user:$SMB_PASS@$smb_host" < /dev/null 2>/dev/null); then
+        local -a parsed
+        parsed=("${(@f)$(echo "$view_out" | awk 'NR>2 {print $1}' | grep -v '^IPC\$$' | grep -v '^$')}")
+        available_shares+=("${parsed[@]}")
+    fi
+
+    available_shares+=("Enter manually")
+    local share_name=""
+
+    if [[ ${#available_shares[@]} -gt 1 ]]; then
+        pick_from_list "Select volume to mount:" "${available_shares[@]}"
+        if [[ "$PICKED" == "Enter manually" ]]; then
+            read -r "share_name? Share name: "
+        else
+            share_name="$PICKED"
+        fi
+    else
+        print_err "Could not list shares automatically. Check credentials or firewall."
+        read -r "share_name? Share name: "
+    fi
+
+    if [[ " ${SHARES[*]} " =~ $share_name ]]; then
+        print_err "Share '$share_name' already exists. Use update instead."
+        exit 1
+    fi
+    if ! test_mount "$smb_user" "$SMB_PASS" "$smb_host" "$share_name"; then
+        print_err "Mount verification failed.Aborting."
+        print_err "The share '$share_name' might not exist, or credentials are wrong."
+        exit 1
+    fi
+    print_ok "Access verified"
+    SHARES+=("$share_name")
+    SMB_HOST_MAP[$share_name]="$smb_host"
+    SMB_USER_MAP[$share_name]="$smb_user"
+
+    apply_share_config "$share_name"
+    print_ok "'$share_name'added successfully"
+}
+
+update() {
+    if [[ ${#SHARES[@]} -eq 0 ]]; then
+        print_warn "No shares configured."
+        exit 0
+    fi
+
+    pick_from_list "Select share to update:" "${SHARES[@]}"
+    local share_name="$PICKED"
+    local host_hint="${SMB_HOST_MAP[$share_name]:+ [${SMB_HOST_MAP[$share_name]}]}"
+    local user_hint="${SMB_USER_MAP[$share_name]:+ [${SMB_USER_MAP[$share_name]}]}"
+    local current_pass=""
+    current_pass=$(security find-generic-password -s "smb-automount-$share_name" -w 2>/dev/null) || true
+    local pass_hint="${current_pass:+ [keep current]}"
+    echo "Current values shown in [brackets]. Press Enter to keep them."
+    discover_smb_hosts
+    if [[ ${#DISCOVERED_HOSTS[@]} -gt 1 ]]; then
+        local -a host_options=()
+        [[ -n "${SMB_HOST_MAP[$share_name]}" ]] && host_options+=("${SMB_HOST_MAP[$share_name]}  (current)")
+        host_options+=("${DISCOVERED_HOSTS[@]}")
+        pick_from_list "Select server:" "${host_options[@]}"
+
+        if [[ "$PICKED" == "Enter manually" ]]; then
+            read -r "input? Server IP${host_hint}: "
+            SMB_HOST_MAP[$share_name]="${input:-${SMB_HOST_MAP[$share_name]}}"
+        else
+            SMB_HOST_MAP[$share_name]="${PICKED%%  *}"
+        fi
+    else
+        read -r "input? Server IP${host_hint}: "
+        SMB_HOST_MAP[$share_name]="${input:-${SMB_HOST_MAP[$share_name]}}"
+    fi
+
+    check_server_reachable "${SMB_HOST_MAP[$share_name]}"
+    read -r "input? SMB User${user_hint}: "
+    SMB_USER_MAP[$share_name]="${input:-${SMB_USER_MAP[$share_name]}}"
+    read -sr "input? Password${pass_hint}: "
+    echo
+    SMB_PASS="${input:-$current_pass}"
+    unload_agent "$share_name"
+    force_unmount "$share_name"
+    sleep 1
+
+    if ! test_mount "${SMB_USER_MAP[$share_name]}" "$SMB_PASS" "${SMB_HOST_MAP[$share_name]}" "$share_name"; then
+        print_err "Mount verification failed! Cannot update with these settings."
+        print_warn "Restoring previous working configuration..."
+        load_agent "$share_name"
+        exit 1
+    fi
+
+    print_ok "Access verified!"
+    apply_share_config "$share_name"
+    print_ok "'$share_name' updated"
+}
+
+usage() {
+    echo "Usage: install.sh [command] [flag]"
+    echo "Commands:"
+    echo "  add,       -a          Add a new SMB share (discovers hosts on network)"
+    echo "  remove,    -r          Remove a share (interactive picker)"
+    echo "  remove,    -r --all    Remove all shares"
+    echo "  list,      -ls         List configured shares"
+    echo "  update,    -u          Update a share (interactive picker)"
+    echo "  uninstall, -un         Remove everything"
+}
+
+main() {
+    load_config || true
+
+    case "$1" in
+    add | -a) add ;;
+    remove | -r) remove "$2" ;;
+    list | -ls) list ;;
+    update | -u) update ;;
+    uninstall | -un) uninstall ;;
+    help | -h | --help) usage ;;
+    *)
+        usage
+        ;;
+    esac
+}
+main "$@"
