@@ -40,7 +40,7 @@ brew tap davidrlopez/tap
 brew install smb-automount
 ```
 
- <img src="install.png" width="400" alt="Installation process via Brew">
+ <img src="install.png" width="800" alt="Installation process via Brew">
 
 > Manual installation
 
@@ -78,7 +78,7 @@ During `-a || --add`, the script will ask for:
 | `uninstall`    | `-un` | Remove everything — agents, scripts, config, sudoers entry |
 | `help`         | `-h`  | Show usage                                                 |
 
-## <img src="usage.png" width="400" alt="Usage examples">
+## <img src="usage.png" width="800" alt="Usage examples">
 
 ## How it works
 
