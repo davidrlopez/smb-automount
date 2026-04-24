@@ -130,7 +130,7 @@ Persistence: Registers a native LaunchAgent that runs every 15 seconds.
 ## Uninstalling
 
 ```zsh
-./install.sh --uninstall
+smb-automount --uninstall
 ```
 
 This will:
