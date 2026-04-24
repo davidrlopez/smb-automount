@@ -65,7 +65,7 @@ During `-a || --add`, the script will ask for:
 ## Usage
 
 ```zsh
-./install.sh [command]
+smb-automount [command]
 ```
 
 | Command        | Alias | Description                                                |
