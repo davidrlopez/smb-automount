@@ -146,5 +146,4 @@ This will:
 
 ## License
 
-MIT © David Román López
-Copyright (c) 2026 David Román López
+Apache-2.0 © 2026 David Román López. See [LICENSE](LICENSE).
