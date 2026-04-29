@@ -24,48 +24,26 @@ pick_from_list() {
     local prompt=$1
     shift
     local -a items=("$@")
-    local selected=1
-    local key ESC=$'\033'
-    tput civis 2>/dev/null
-_render_list() {
-        echo "$prompt"
-        for (( i=1; i<=${#items[@]}; i++ )); do
-            if [[ $i -eq $selected ]]; then
-                echo -e "  ${GREEN}▶ ${items[$i]}${NC}"
-            else
-                echo "    ${items[$i]}"
-            fi
-        done
-    }
-    _clear_list() {
-        for (( i=0; i<=${#items[@]}; i++ )); do
-            tput cuu1; tput el
-        done
-    }
+    local choice=""
 
-    _render_list
+    if [[ ${#items[@]} -eq 0 ]]; then
+        print_err "No options available"
+        exit 1
+    fi
 
-    while IFS= read -r -s -k1 key; do
-        if [[ $key == $ESC ]]; then
-            read -r -s -k2 -t 0.1 key2
-            key="$key$key2"
+    echo "$prompt"
+    local i
+    for (( i=1; i<=${#items[@]}; i++ )); do
+        echo "  [$i] ${items[$i]}"
+    done
+
+    while true; do
+        read -r "choice? Select an option [1-${#items[@]}]: "
+        if [[ "$choice" == <-> ]] && (( choice >= 1 && choice <= ${#items[@]} )); then
+            PICKED="${items[$choice]}"
+            return 0
         fi
-        case "$key" in
-            $ESC'[A'|$ESC'OA')
-                (( selected > 1 )) && (( selected-- ))
-                ;;
-            $ESC'[B'|$ESC'OB')
-                (( selected < ${#items[@]} )) && (( selected++ ))
-                ;;
-            $'\n'|$'\r')
-                _clear_list
-                tput cnorm 2>/dev/null
-                PICKED="${items[$selected]}"
-                return 0
-                ;;
-        esac
-        _clear_list
-        _render_list
+        print_err "Invalid selection"
     done
 }
 
@@ -134,6 +112,38 @@ urlencode() {
     echo "${encoded}"
 }
 
+build_smb_service_url() {
+    local user=$(urlencode "$1")
+    local pass=$(urlencode "$2")
+    local host=$3
+    echo "//$user:$pass@$host"
+}
+
+build_smb_share_url() {
+    local share=$(urlencode "$4")
+    echo "$(build_smb_service_url "$1" "$2" "$3")/$share"
+}
+
+is_share_mounted() {
+    local mount_point="/Volumes/$1"
+    mount | grep -Fq " on $mount_point ("
+}
+
+wait_for_mount() {
+    local share_name=$1
+    local attempts=${2:-10}
+
+    while (( attempts > 0 )); do
+        if is_share_mounted "$share_name"; then
+            return 0
+        fi
+        sleep 1
+        (( attempts-- ))
+    done
+
+    return 1
+}
+
 load_config() {
     if [[ -f "$CONFIG_FILE" ]]; then
         source "$CONFIG_FILE"
@@ -181,15 +191,15 @@ save_keychain() {
 }
 
 test_mount() {
-    local user=$(urlencode "$1")
-    local pass=$(urlencode "$2")
     local host=$3
     local share=$4
+    local mount_url
+    mount_url=$(build_smb_share_url "$1" "$2" "$host" "$share")
     print_warn "Verifying access to '//$host/$share'..."
     local tmp_dir
     tmp_dir=$(mktemp -d)
 
-    if mount_smbfs "//$user:$pass@$host/$share" "$tmp_dir" &>/dev/null; then
+    if mount_smbfs "$mount_url" "$tmp_dir" &>/dev/null; then
         diskutil unmount force "$tmp_dir" &>/dev/null || umount -f "$tmp_dir" &>/dev/null
         rmdir "$tmp_dir" &>/dev/null
         return 0
@@ -224,26 +234,36 @@ setup_sudoers() {
 
 generate_mount_script() {
     local share_name=$1
-    local smb_user_enc=$(urlencode "{SMB_USER_MAP[$share_name]}")
+    local smb_user="${SMB_USER_MAP[$share_name]}"
+    local smb_user_enc=$(urlencode "$smb_user")
     local smb_host="${SMB_HOST_MAP[$share_name]}"
+    local share_enc=$(urlencode "$share_name")
     local mount_script="$SCRIPTS_DIR/smb-automount-$share_name.sh"
+    local uid
+    uid=$(id -u)
     mkdir -p "$SCRIPTS_DIR"
 
     cat >"$mount_script" <<SCRIPT_EOF
 #!/bin/bash
 sleep \$((RANDOM % 5))
-if ! mount | grep -q "on /Volumes/$share_name "; then
+if ! mount | grep -Fq " on /Volumes/$share_name ("; then
 LOCKDIR="/tmp/smb-automount.lock"
     while ! /bin/mkdir "\$LOCKDIR" 2>/dev/null; do
         sleep 1
     done
     trap 'rmdir "\$LOCKDIR" 2>/dev/null' EXIT
-    RAW_PASS=\$(security find-generic-password -s "smb-automount-$share_name" -w 2>/dev/null)
+    RAW_PASS=\$(security find-generic-password -s "smb-automount-$share_name" -a "$smb_user" -w 2>/dev/null)
     if [ -n "\$RAW_PASS" ]; then
         PASSWORD=\$(printf '%s' "\$RAW_PASS" | perl -MURI::Escape -ne 'print uri_escape(\$_)')
         sudo /bin/mkdir -p "/Volumes/$share_name"
-        sudo /usr/sbin/chown $UID "/Volumes/$share_name"
-        /sbin/mount_smbfs "//$user_enc:\${PASSWORD}@$smb_host/$share_name" "/Volumes/$share_name"
+        sudo /usr/sbin/chown $uid "/Volumes/$share_name"
+        if ! /sbin/mount_smbfs "//$smb_user_enc:\${PASSWORD}@$smb_host/$share_enc" "/Volumes/$share_name"; then
+            echo "Mount failed for //$smb_host/$share_name"
+            exit 1
+        fi
+    else
+        echo "Password not found in keychain"
+        exit 1
     fi
 fi
 SCRIPT_EOF
@@ -284,11 +304,26 @@ PLIST_EOF
 cleanup_stale_mounts() {
     for share in "${SHARES[@]}"; do
         local mount_point="/Volumes/$share"
-        if [ -d "$mount_point" ] && ! mount | grep -q "$mount_point"; then
+        if [ -d "$mount_point" ] && ! is_share_mounted "$share"; then
             print_warn "Found stale mount point $mount_point"
             sudo rmdir "$mount_point" 2>/dev/null || true
         fi
     done
+}
+
+run_mount_script() {
+    local share_name=$1
+    local mount_script="$SCRIPTS_DIR/smb-automount-$share_name.sh"
+    local log_file="$CONFIG_DIR/mount-$share_name.log"
+
+    mkdir -p "$CONFIG_DIR"
+
+    if "$mount_script" >"$log_file" 2>&1 && wait_for_mount "$share_name" 10; then
+        return 0
+    fi
+
+    print_err "Mount failed for '$share_name'. See $log_file"
+    return 1
 }
 
 load_agent() {
@@ -302,7 +337,13 @@ load_agent() {
     force_unmount "$share_name"
 
     if launchctl load "$plist"; then
-        print_ok "Launch Agent loaded"
+        if run_mount_script "$share_name"; then
+            print_ok "Launch Agent loaded"
+            print_ok "'$share_name' mounted successfully"
+        else
+            force_unmount "$share_name"
+            exit 1
+        fi
     else
         print_err "Launch Agent failed to load"
         exit 1
@@ -329,7 +370,7 @@ force_unmount() {
     local share_name=$1
     local mount_point="/Volumes/$share_name"
 
-    if mount | grep -q "on $mount_point "; then
+    if is_share_mounted "$share_name"; then
         diskutil unmount force "$mount_point" 2>/dev/null || umount -f "$mount_point" 2>/dev/null || true
     fi
 
@@ -446,7 +487,7 @@ add() {
     local -a available_shares=()
     local view_out
 
-    if view_out=$(smbutil view "//$smb_user:$SMB_PASS@$smb_host" < /dev/null 2>/dev/null); then
+    if view_out=$(smbutil view "$(build_smb_service_url "$smb_user" "$SMB_PASS" "$smb_host")" < /dev/null 2>/dev/null); then
         local -a parsed
         parsed=("${(@f)$(echo "$view_out" | awk 'NR>2 {print $1}' | grep -v '^IPC\$$' | grep -v '^$')}")
         available_shares+=("${parsed[@]}")
@@ -472,7 +513,7 @@ add() {
         exit 1
     fi
     if ! test_mount "$smb_user" "$SMB_PASS" "$smb_host" "$share_name"; then
-        print_err "Mount verification failed.Aborting."
+        print_err "Mount verification failed. Aborting."
         print_err "The share '$share_name' might not exist, or credentials are wrong."
         exit 1
     fi
@@ -482,7 +523,7 @@ add() {
     SMB_USER_MAP[$share_name]="$smb_user"
 
     apply_share_config "$share_name"
-    print_ok "'$share_name'added successfully"
+    print_ok "'$share_name' added successfully"
 }
 
 update() {
@@ -540,7 +581,7 @@ update() {
 }
 
 usage() {
-    echo "Usage: install.sh [command] [flag]"
+    echo "Usage: smb-automount [command] [flag]"
     echo "Commands:"
     echo "  add,       -a          Add a new SMB share (discovers hosts on network)"
     echo "  remove,    -r          Remove a share (interactive picker)"
